@@ -136,6 +136,11 @@ APPROACH_TIMEOUT = 13             # give up on one crystal after this many secon
 TURN_PX_PER_MOUSE = 0.55          # screen px a target moves per mouse px of turn (to follow it through a turn)
 LOCK_MATCH_PX    = 200            # the locked target = the blob within this many px of where it should be now
 LOCK_LOST_TIME   = 1.2            # keep heading for the locked target this long after losing sight of it
+# --- Held-pickaxe check: real nodes slide across the screen when the camera turns, the pickaxe doesn't ---
+HAND_TEST_SHIFT  = 70             # only judge after a turn that should move the target at least this many px
+HAND_STILL_PX    = 35             # target stayed within this many px of where it was = glued to the camera
+HAND_SPOT_PX     = 90             # ignore blobs this close to a spot the pickaxe was caught at...
+HAND_SPOT_TIME   = 8.0            # ...for this many seconds
 
 # --- Mining ---
 MINE_TIME   = 10.0                # max seconds to mine one crystal
@@ -165,7 +170,7 @@ DEBUG_LOG        = True           # write every decision to miner_log.txt next t
 DEBUG_VIEW_EVERY = 1.5            # save debug_view.png (what the bot sees) every N seconds; 0 = off
 # ==================================================================
 
-VERSION = "v19.1 no fog on sunny icy ground"
+VERSION = "v19.2 pickaxe = whatever stays put when the camera turns"
 FROZEN = getattr(sys, "frozen", False)   # True when running as the built CrystalMiner.exe
 # the exe unpacks to a temp folder that gets deleted, so its files go next to the exe instead
 _HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
@@ -174,6 +179,7 @@ VIEW_PATH = os.path.join(_HERE, "debug_view.png")
 DETECT_PATH = os.path.join(_HERE, "crystal_detect.png")
 STATE = {"text": "idle", "target": None, "fog": False, "day": False, "live": False}   # live = dashboard owns the console
 STATS = {"mined": 0, "hits": 0}
+HAND_SPOTS = []                   # (x, y, time) where a blob didn't move when the camera turned = the held pickaxe
 LOG_TAIL = deque(maxlen=9)        # latest console lines, for the dashboard
 _last_view = [0.0]
 
@@ -511,6 +517,12 @@ def _maybe_save_view(shot, blobs, w, h):
     except Exception:
         pass
 
+def not_hand(blobs):
+    """Leave out blobs where the held pickaxe was recently caught (see HAND_* settings)."""
+    now = time.monotonic()
+    HAND_SPOTS[:] = [s for s in HAND_SPOTS if now - s[2] < HAND_SPOT_TIME]
+    return [b for b in blobs if all(abs(b[1]-x) > HAND_SPOT_PX or abs(b[2]-y) > HAND_SPOT_PX for x, y, _ in HAND_SPOTS)]
+
 def solid_targets(blobs):
     """Blobs worth walking to: big enough, or a small crystal with another one beside it.
     A lone small speck is left out. Fog shapes are all small, so they all stay."""
@@ -720,6 +732,7 @@ def approach_and_mine(target):
     STATE["text"] = "APPROACH"; STATE["target"] = target
     t0 = time.monotonic()
     last_seen = t0
+    pre_turn = None                  # where the target was before the last turn (pickaxe check)
     key_down('w'); walking = True
     try:
         while time.monotonic() < deadline:
@@ -727,18 +740,25 @@ def approach_and_mine(target):
             if popup_busy.is_set():
                 if walking: key_up('w'); walking = False
                 time.sleep(0.05); continue
-            blobs = detect_crystals()
+            blobs = not_hand(detect_crystals())
             # stay locked on the SAME node: the blob closest to where the target should be now.
             # Never switch to a different node mid-approach (that made it flip left/right).
             near = [b for b in blobs if abs(b[1]-target[1]) <= LOCK_MATCH_PX and abs(b[2]-target[2]) <= LOCK_MATCH_PX]
             if near:
                 t = min(near, key=lambda b: (b[1]-target[1])**2 + (b[2]-target[2])**2)
                 last_seen = time.monotonic()
+                # after a real turn a node slides across the screen; the held pickaxe stays put
+                if pre_turn and abs(pre_turn[1] - target[1]) >= HAND_TEST_SHIFT \
+                        and abs(t[1] - pre_turn[1]) <= HAND_STILL_PX and abs(t[2] - pre_turn[2]) <= HAND_STILL_PX:
+                    HAND_SPOTS.append((t[1], t[2], time.monotonic()))
+                    log(f"  target at ({t[1]},{t[2]}) didn't move when the camera turned -> it's the pickaxe, ignoring it")
+                    return None
             elif time.monotonic() - last_seen < LOCK_LOST_TIME:
                 t = target                   # a bad frame / pickaxe in the way: keep going where it was
             else:
                 log(f"  lost the locked node at ({target[1]},{target[2]}) -> back to scanning")
                 return target
+            pre_turn = None
             target = t
             STATE["target"] = t
             err = t[1] - cx_scr
@@ -764,6 +784,7 @@ def approach_and_mine(target):
                 turn_camera(turn)
                 # the node slides across the screen by the turn: move the lock with it
                 target = (t[0], int(t[1] - turn * TURN_PX_PER_MOUSE), t[2])
+                pre_turn = t
                 STATE["target"] = target
                 time.sleep(0.05)
             else:
@@ -794,7 +815,7 @@ def miner_loop():
         if not run_on.is_set():
             STATE["text"] = "paused"; STATE["target"] = None
             time.sleep(0.1); continue
-        blobs = detect_crystals()
+        blobs = not_hand(detect_crystals())
         solid = solid_targets(blobs)
         if solid:
             scans = 0
