@@ -10,8 +10,9 @@ it, and mines it by clicking on it. No compass, no taught route.
 
 HONEST LIMITS
   Visual steering, so it can misjudge distance, clip terrain, or chase a
-  crystal it can't quite reach. It mines whatever blue it can see, in no
-  fixed order. Automating gameplay like this can break Roblox's rules.
+  crystal it can't quite reach. It heads for the nearest node it sees and
+  sticks with that one until it's mined or gone.
+  Automating gameplay like this can break Roblox's rules.
   LIGHTING: this is a DUSK farmer. At dusk (pink/orange sky) the snow
   desaturates and the crystals stay vivid blue, so they're easy to pick out.
   At full night / night+snow / bright midday the whole scene turns one shade
@@ -53,6 +54,9 @@ BLUE_UPPER = (125, 255, 255)      # lower it if it misses dim crystals
 # them; requiring brightness (V>=150) keeps the dark-blue night snow out. Both filters are combined.
 DAY_LOWER  = (92, 155, 150)
 DAY_UPPER  = (112, 255, 255)
+DAY_SNOW_V_MIN = 185              # day filter only runs when the snow is this bright (median V).
+                                  #   Night snow measures V ~140-153, S ~145-170: right inside the day
+                                  #   filter, so at night it lit up the whole foreground as "crystal".
 HORIZON_Y_FRAC = 0.30             # ignore everything above this line (sky, snowy tree branches)
 
 # --- Fog fallback: in fog the crystals bleach to white, so look for small DARK shapes on the snow ---
@@ -74,6 +78,12 @@ SPECK_NEAR = 120                  # ...within this many px (lone specks made the
 SCENERY_BOTTOM_FRAC = 0.55        # a big blob whose BOTTOM edge is above this line...
 SCENERY_MAX_AREA = 5000           # ...and bigger than this is sky/hill (a node you're at reaches lower)
 FLAT_RATIO       = 3.5            # blobs this many times wider than tall are slopes, not crystals
+PICKAXE_CHECK    = True           # drop the blue pickaxe head mid-swing (it rises into view while mining)
+PICKAXE_MIN_X    = 0.55           # only blobs right of this line (the pickaxe swings in from the right)
+PICKAXE_MIN_AREA = 2000           # ...that are this big...
+PICKAXE_SOLIDITY = 0.65           # ...and hollow (area / convex hull below this; crystal clusters are 0.8+)
+PICKAXE_ELONG    = 2.0            #    and stretched, or very stretched (3x) and not quite solid (below 0.9)
+BOTTOM_IGNORE_Y  = 0.95           # ignore blobs centred below this line (held items under the hotbar)
 
 # --- What counts as "close enough to mine" ---
 CLOSE_Y_FRAC = 0.78               # crystal centre below this fraction of screen height = close
@@ -120,6 +130,9 @@ STEER_TOL   = 70                  # don't bother turning if within this many px 
 STEER_GAIN  = 1.0                 # mouse px per 1 px of horizontal error (~0.55 screen px per mouse px)
 MAX_STEER   = 400                 # cap per turn tick
 APPROACH_TIMEOUT = 13             # give up on one crystal after this many seconds
+TURN_PX_PER_MOUSE = 0.55          # screen px a target moves per mouse px of turn (to follow it through a turn)
+LOCK_MATCH_PX    = 200            # the locked target = the blob within this many px of where it should be now
+LOCK_LOST_TIME   = 1.2            # keep heading for the locked target this long after losing sight of it
 
 # --- Mining ---
 MINE_TIME   = 10.0                # max seconds to mine one crystal
@@ -149,14 +162,14 @@ DEBUG_LOG        = True           # write every decision to miner_log.txt next t
 DEBUG_VIEW_EVERY = 1.5            # save debug_view.png (what the bot sees) every N seconds; 0 = off
 # ==================================================================
 
-VERSION = "v18 fog-hand-fix (19:40)"
+VERSION = "v19 night-snow + pickaxe filter, target lock"
 FROZEN = getattr(sys, "frozen", False)   # True when running as the built CrystalMiner.exe
 # the exe unpacks to a temp folder that gets deleted, so its files go next to the exe instead
 _HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 LOG_PATH  = os.path.join(_HERE, "miner_log.txt")
 VIEW_PATH = os.path.join(_HERE, "debug_view.png")
 DETECT_PATH = os.path.join(_HERE, "crystal_detect.png")
-STATE = {"text": "idle", "target": None, "fog": False, "live": False}   # live = dashboard owns the console
+STATE = {"text": "idle", "target": None, "fog": False, "day": False, "live": False}   # live = dashboard owns the console
 STATS = {"mined": 0, "hits": 0}
 LOG_TAIL = deque(maxlen=9)        # latest console lines, for the dashboard
 _last_view = [0.0]
@@ -258,10 +271,17 @@ def turn_camera(dx):
 
 # ======================= CRYSTAL DETECTION =======================
 def crystal_mask(hsv):
-    """Crystal pixels: vivid blue (dusk/night filter) OR bright pale cyan (day filter)."""
+    """Crystal pixels: vivid blue (dusk/night filter) OR, in daylight only, bright pale cyan (day filter)."""
     m1 = cv2.inRange(hsv, np.array(BLUE_LOWER), np.array(BLUE_UPPER))
+    if not STATE.get("day"):
+        return m1
     m2 = cv2.inRange(hsv, np.array(DAY_LOWER), np.array(DAY_UPPER))
     return cv2.bitwise_or(m1, m2)
+
+def update_daylight(hsv, w, h):
+    """Daylight = the snow in the middle of the screen is bright. Sets STATE["day"] for crystal_mask."""
+    band = hsv[int(0.45*h):int(0.80*h), int(0.05*w):int(0.95*w), 2]
+    STATE["day"] = float(np.median(band)) >= DAY_SNOW_V_MIN
 
 def zone_rect(w, h):
     return (int(ZONE[0]*w), int(ZONE[1]*h), int((ZONE[2]-ZONE[0])*w), int((ZONE[3]-ZONE[1])*h))
@@ -351,11 +371,12 @@ def detect_crystals():
     w, h = screen_size()
     shot = pyautogui.screenshot()
     hsv = cv2.cvtColor(np.asarray(shot), cv2.COLOR_RGB2HSV)
+    update_daylight(hsv, w, h)
     mask = crystal_mask(hsv)
     raw_crystals = mask.copy()                       # before HUD masking (for the node check)
     mask = _hud_mask(mask, w, h)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
-    n, _, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
+    n, labels, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
     blobs = []
     for i in range(1, n):
         area = int(stats[i, cv2.CC_STAT_AREA])
@@ -368,6 +389,11 @@ def detect_crystals():
         if area > SCENERY_MAX_AREA and bottom < SCENERY_BOTTOM_FRAC * h:
             continue
         if area > 1500 and bw > FLAT_RATIO * bh:
+            continue
+        if cy > BOTTOM_IGNORE_Y * h:
+            continue
+        if PICKAXE_CHECK and area >= PICKAXE_MIN_AREA and cx >= PICKAXE_MIN_X * w and is_pickaxe(labels, stats, i):
+            dlog(f"    dropped pickaxe-shaped blob {(area, cx, cy)}")
             continue
         blobs.append((area, cx, cy))
     blobs.sort(reverse=True)
@@ -395,6 +421,19 @@ def detect_crystals():
             STATE["fog"] = False
     _maybe_save_view(shot, blobs, w, h)
     return blobs
+
+def is_pickaxe(labels, stats, i):
+    """The pickaxe head is a long, hollow bar; a crystal cluster is a solid lump."""
+    x, y, bw, bh = (int(stats[i, k]) for k in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
+    m = (labels[y:y+bh, x:x+bw] == i).astype(np.uint8)
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cs:
+        return False
+    c = max(cs, key=cv2.contourArea)
+    solidity = int(stats[i, cv2.CC_STAT_AREA]) / max(1.0, cv2.contourArea(cv2.convexHull(c)))
+    rw, rh = cv2.minAreaRect(c)[1]
+    elong = max(rw, rh) / max(1.0, min(rw, rh))
+    return (elong >= PICKAXE_ELONG and solidity < PICKAXE_SOLIDITY) or (elong >= 1.5 * PICKAXE_ELONG and solidity < 0.9)
 
 def dark_base_mask(gray, w, h, crystal_px=None):
     """Crater / grey-stone pixels: clearly darker than the snow around them -- NOT counting the
@@ -476,8 +515,13 @@ def solid_targets(blobs):
             or any(o is not b and abs(o[1] - b[1]) <= SPECK_NEAR and abs(o[2] - b[2]) <= SPECK_NEAR for o in blobs)]
 
 def pick_target(blobs):
-    """Prefer the biggest (nearest) crystal."""
-    return blobs[0] if blobs else None
+    """The node to commit to: the nearest one (lowest on screen), ties go to the most central.
+    The bot then sticks with it until it's mined or truly gone (no more picking the biggest each
+    frame: similar-sized nodes made it flip left/right between them)."""
+    if not blobs:
+        return None
+    w = screen_size()[0]
+    return max(blobs, key=lambda b: (b[2] // 40, -abs(b[1] - w // 2)))
 
 def pick_mine_target(blobs, w, h):
     """The crystal in front of you to swing at: low on screen (close), not a far speck,
@@ -662,35 +706,34 @@ def mine_crystal(target):
 
 # ======================= APPROACH =======================
 def approach_and_mine(target):
+    """Walk to the target and mine it. Returns None once it mined, else the last known position
+    of the target so the main loop can pick the same node up again instead of a different one."""
     w, h = screen_size()
     cx_scr = w // 2
     deadline = time.monotonic() + APPROACH_TIMEOUT
     log(f"approaching crystal at ({target[1]},{target[2]}) area={target[0]}")
     STATE["text"] = "APPROACH"; STATE["target"] = target
     t0 = time.monotonic()
+    last_seen = t0
     key_down('w'); walking = True
     try:
         while time.monotonic() < deadline:
-            if stop_all.is_set() or not run_on.is_set(): return
+            if stop_all.is_set() or not run_on.is_set(): return None
             if popup_busy.is_set():
                 if walking: key_up('w'); walking = False
                 time.sleep(0.05); continue
             blobs = detect_crystals()
-            if not blobs:
-                log("  lost sight of all crystals -> back to scanning")
-                return                       # lost sight of everything -> back to scanning
-            # keep chasing the blob nearest the current target, else the solid one nearest the centre
-            # (not the biggest: edge blobs look stretched, so "biggest" flipped left/right after each turn)
-            near = [b for b in blobs if abs(b[1]-target[1]) < 240 and abs(b[2]-target[2]) < 240]
+            # stay locked on the SAME node: the blob closest to where the target should be now.
+            # Never switch to a different node mid-approach (that made it flip left/right).
+            near = [b for b in blobs if abs(b[1]-target[1]) <= LOCK_MATCH_PX and abs(b[2]-target[2]) <= LOCK_MATCH_PX]
             if near:
-                t = max(near)
+                t = min(near, key=lambda b: (b[1]-target[1])**2 + (b[2]-target[2])**2)
+                last_seen = time.monotonic()
+            elif time.monotonic() - last_seen < LOCK_LOST_TIME:
+                t = target                   # a bad frame / pickaxe in the way: keep going where it was
             else:
-                solid = solid_targets(blobs)
-                if not solid:
-                    log("  target lost, only lone specks left -> back to scanning")
-                    return
-                t = min(solid, key=lambda b: abs(b[1] - cx_scr))
-                dlog(f"    target lost, switching to most central {t}")
+                log(f"  lost the locked node at ({target[1]},{target[2]}) -> back to scanning")
+                return target
             target = t
             STATE["target"] = t
             err = t[1] - cx_scr
@@ -706,7 +749,7 @@ def approach_and_mine(target):
                 fresh = detect_crystals()
                 mt = pick_mine_target(fresh, w, h)
                 mine_crystal(mt if mt else t)
-                return
+                return None
             # steer toward it
             if abs(err) > STEER_TOL:
                 turn = max(-MAX_STEER, min(MAX_STEER, err * STEER_GAIN))
@@ -714,6 +757,9 @@ def approach_and_mine(target):
                      f"close={close} blobs={len(blobs)}")
                 if walking: key_up('w'); walking = False   # turn cleanly, then resume
                 turn_camera(turn)
+                # the node slides across the screen by the turn: move the lock with it
+                target = (t[0], int(t[1] - turn * TURN_PX_PER_MOUSE), t[2])
+                STATE["target"] = target
                 time.sleep(0.05)
             else:
                 dlog(f"    t={time.monotonic()-t0:.1f}s WALK  tgt={t} err={err:+d} zone_px={zp} blobs={len(blobs)}")
@@ -728,15 +774,17 @@ def approach_and_mine(target):
                         time.sleep(0.08)
                         mt = pick_mine_target(detect_crystals(), w, h)
                         mine_crystal(mt if mt else t)
-                        return
+                        return None
                     time.sleep(ZONE_POLL)
         log(f"  approach timed out after {APPROACH_TIMEOUT}s (last target {target})")
+        return target
     finally:
         if walking: key_up('w')
 
 # ======================= MAIN LOOP =======================
 def miner_loop():
     scans = 0
+    locked = None                    # last node we were heading for but didn't mine: stick with it
     while not stop_all.is_set():
         if not run_on.is_set():
             STATE["text"] = "paused"; STATE["target"] = None
@@ -746,16 +794,19 @@ def miner_loop():
         if solid:
             scans = 0
             dlog(f"found {len(solid)} {'FOG-shapes' if STATE.get('fog') else 'crystals'}, top3={solid[:3]}")
-            approach_and_mine(pick_target(solid))
+            same = [b for b in solid if locked and abs(b[1]-locked[1]) <= LOCK_MATCH_PX and abs(b[2]-locked[2]) <= LOCK_MATCH_PX]
+            tgt = min(same, key=lambda b: (b[1]-locked[1])**2 + (b[2]-locked[2])**2) if same else pick_target(solid)
+            locked = approach_and_mine(tgt)
             STATE["target"] = None
         else:
             scans += 1
+            locked = None
             STATE["text"] = f"SCAN {scans}/{SCAN_TICKS}"; STATE["target"] = None
             if scans >= SCAN_TICKS:
                 scans = 0
                 if blobs:                                # full turn found only lone specks: better than idling
                     log(f"full scan found only lone specks, trying {blobs[0]}")
-                    approach_and_mine(pick_target(blobs))
+                    locked = approach_and_mine(pick_target(blobs))
                     STATE["target"] = None
                     continue
                 log(f"no crystals found; idling {IDLE_WAIT}s (respawn)")
