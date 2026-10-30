@@ -63,6 +63,9 @@ HORIZON_Y_FRAC = 0.30             # ignore everything above this line (sky, snow
 FOG_MODE      = True              # use the fallback when it's foggy and the colour filter sees nothing
 FOG_STD_MAX   = 18                # fog = the middle of the screen is this flat (brightness std)...
 FOG_MEAN_MIN  = 140               # ...and this bright. (Clear day/dusk/night all measured std >= 22)
+FOG_TOP_STD_MAX = 24              # ...and the horizon (trees/mountains) is washed out too. A sunny day on
+                                  #   smooth icy ground has a flat middle (std 14-17) but a crisp horizon
+                                  #   (std 28-38); without this the ripple shadows were chased as "fog nodes".
 FOG_CONTRAST  = 14                # a node is this much darker than the snow right around it
 FOG_MIN_Y_FRAC = 0.42             # only look on the ground (below the fogged mountains)
 FOG_HAND_Y_FRAC = 0.60            # ignore the right side below this line (pickaxe tip: ~0.69h, higher mid-swing)
@@ -162,7 +165,7 @@ DEBUG_LOG        = True           # write every decision to miner_log.txt next t
 DEBUG_VIEW_EVERY = 1.5            # save debug_view.png (what the bot sees) every N seconds; 0 = off
 # ==================================================================
 
-VERSION = "v19 night-snow + pickaxe filter, target lock"
+VERSION = "v19.1 no fog on sunny icy ground"
 FROZEN = getattr(sys, "frozen", False)   # True when running as the built CrystalMiner.exe
 # the exe unpacks to a temp folder that gets deleted, so its files go next to the exe instead
 _HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
@@ -454,7 +457,9 @@ def has_base(base, blob, w, h):
 
 def is_foggy(gray, w, h):
     band = gray[int(0.35*h):int(0.72*h), int(0.05*w):int(0.95*w)]
-    return float(band.std()) < FOG_STD_MAX and float(band.mean()) > FOG_MEAN_MIN
+    top = gray[int(0.10*h):int(0.35*h), int(0.05*w):int(0.75*w)]    # horizon, left of the quest box
+    return (float(band.std()) < FOG_STD_MAX and float(band.mean()) > FOG_MEAN_MIN
+            and float(top.std()) < FOG_TOP_STD_MAX)
 
 def fog_blobs(gray, w, h):
     """Small compact patches darker than the snow around them = fogged-over nodes."""
