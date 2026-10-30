@@ -1,0 +1,14 @@
+# Build output and archives
+*.exe
+*.rar
+*.zip
+build/
+dist/
+*.spec
+__pycache__/
+venv/
+
+# Files the miner writes at runtime
+miner_log.txt
+debug_view.png
+crystal_detect.png
